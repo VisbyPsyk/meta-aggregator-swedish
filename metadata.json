@@ -1,0 +1,6 @@
+{
+  "name": "Swedish Universal Subtitles",
+  "description": "Stremio addon providing Swedish subtitles with native and AI auto-translation fallbacks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
