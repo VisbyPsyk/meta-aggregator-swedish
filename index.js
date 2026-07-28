@@ -1,4 +1,15 @@
-import 'dotenv/config';
+try {
+  if (typeof process.loadEnvFile === 'function') {
+    process.loadEnvFile();
+  }
+} catch (e) {
+  // .env file missing or process.env already set by host
+}
+try {
+  await import('dotenv/config');
+} catch (e) {
+  // dotenv package not installed or unnecessary in production
+}
 import express from 'express';
 import cors from 'cors';
 import pkg from 'stremio-addon-sdk';
