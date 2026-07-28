@@ -112,12 +112,81 @@ const fetchOpenSubtitles = async (type, id, extra = {}) => {
   }
 };
 
-const fetchWithHashFallback = async (type, fullId, extra = {}) => {
-  if (extra.videoHash) {
-    const hashedSubs = await fetchOpenSubtitles(type, fullId, extra);
-    if (hashedSubs.length > 0) return hashedSubs;
+const scoreSubtitle = (sub, videoFilename) => {
+  let score = 0;
+  if (sub.isHashMatch || sub.m === 'h') score += 1000;
+  
+  if (videoFilename && sub.filename) {
+    const fnLow = videoFilename.toLowerCase();
+    const subFnLow = sub.filename.toLowerCase();
+    
+    const keywords = [
+      '2160p', '1080p', '720p', '4k', 'bluray', 'bdrip', 'brrip', 'web-dl', 
+      'webrip', 'hdtv', 'yify', 'rarbg', 'eztv', 'flux', 'psa', 'remux', 
+      'extended', 'unrated', 'proper', 'repack', 'x264', 'x265', 'h264', 'hevc'
+    ];
+    for (const kw of keywords) {
+      if (fnLow.includes(kw) && subFnLow.includes(kw)) {
+        score += 50;
+      }
+    }
   }
-  return await fetchOpenSubtitles(type, fullId);
+  score += parseInt(sub.g || '0', 10);
+  return score;
+};
+
+const fetchMergedSubtitles = async (type, fullId, extra = {}) => {
+  const proms = [];
+
+  if (extra.videoHash) {
+    proms.push(
+      fetchOpenSubtitles(type, fullId, extra).then(subs => 
+        subs.map(s => ({ ...s, isHashMatch: true }))
+      )
+    );
+  }
+
+  proms.push(
+    fetchOpenSubtitles(type, fullId).then(subs => 
+      subs.map(s => ({ ...s, isHashMatch: s.m === 'h' }))
+    )
+  );
+
+  const results = await Promise.all(proms);
+  const combined = results.flat();
+
+  const subMap = new Map();
+  for (const sub of combined) {
+    const key = sub.url || sub.id;
+    if (!key) continue;
+    if (subMap.has(key)) {
+      const existing = subMap.get(key);
+      if (sub.isHashMatch) existing.isHashMatch = true;
+    } else {
+      subMap.set(key, { ...sub });
+    }
+  }
+
+  const uniqueSubs = Array.from(subMap.values());
+  const videoFilename = extra.filename || '';
+
+  return uniqueSubs.map(sub => ({
+    ...sub,
+    syncScore: scoreSubtitle(sub, videoFilename)
+  }));
+};
+
+const fixSrtTimecodes = (content) => {
+  let clean = content.trim();
+  clean = clean.replace(/^WEBVTT[^\n]*\n*/i, '');
+  clean = clean.replace(/NOTE[^\n]*\n(?:[^\n]*\n)*/gi, '');
+  clean = clean.replace(/STYLE[^\n]*\n(?:[^\n]*\n)*/gi, '');
+  
+  return clean.replace(/(\b\d{1,2}:)?(\d{2}:\d{2})[\.,](\d{3})\s*-->\s*(\b\d{1,2}:)?(\d{2}:\d{2})[\.,](\d{3})/g, (m, h1, ms1, ms2, h2, ms3, ms4) => {
+    const hh1 = h1 ? h1.replace(':', '').padStart(2, '0') : '00';
+    const hh2 = h2 ? h2.replace(':', '').padStart(2, '0') : '00';
+    return `${hh1}:${ms1},${ms2} --> ${hh2}:${ms3},${ms4}`;
+  });
 };
 
 // Batch Translation Engines
@@ -253,10 +322,8 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
     
     if (!rawContent || typeof rawContent !== 'string') return null;
 
-    // Clean up WEBVTT or SRT formatting quirks
-    let cleanContent = rawContent.trim();
-    cleanContent = cleanContent.replace(/^WEBVTT[^\n]*\n*/i, '');
-    cleanContent = cleanContent.replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, '$1,$2');
+    // Clean up WEBVTT or SRT formatting quirks and fix timecodes
+    const cleanContent = fixSrtTimecodes(rawContent);
 
     const parser = new Parser();
     const subs = parser.fromSrt(cleanContent);
@@ -294,37 +361,48 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
 const builder = new addonBuilder(manifest);
 
 builder.defineSubtitlesHandler(async (args) => {
-  console.log(`[HANDLER] Subtitle request for ${args.type} - ID: ${args.id}`);
+  console.log(`[HANDLER] Subtitle request for ${args.type} - ID: ${args.id}`, args.extra || {});
   try {
     const fullId = args.id;
     const extra = args.extra || {};
     const baseUrl = getBaseUrl();
 
-    const allSubs = await fetchWithHashFallback(args.type, fullId, extra);
+    const allSubs = await fetchMergedSubtitles(args.type, fullId, extra);
     if (!allSubs.length) return { subtitles: [] };
 
     const resultSubtitles = [];
 
-    // 1. Gather all Native Swedish Subtitles from OpenSubtitles
-    const nativeSubs = allSubs.filter(s => s.lang && (s.lang === 'swe' || s.lang === 'sv' || s.lang.startsWith('swe') || s.lang.startsWith('sv')));
-    
+    // 1. Native Swedish Subtitles (Sorted by syncScore descending)
+    const nativeSubs = allSubs
+      .filter(s => s.lang && (s.lang === 'swe' || s.lang === 'sv' || s.lang.startsWith('swe') || s.lang.startsWith('sv')))
+      .sort((a, b) => b.syncScore - a.syncScore);
+
     nativeSubs.forEach((sub, idx) => {
-      const label = nativeSubs.length > 1 
-        ? `🇸🇪 Swedish (Native #${idx + 1})`
-        : `🇸🇪 Swedish (Native)`;
+      let badge = '🇸🇪 Swedish (Native)';
+      if (sub.isHashMatch) {
+        badge = '⚡ 🇸🇪 Swedish (Native - Hash Matched)';
+      } else if (sub.syncScore > 20) {
+        badge = '🇸🇪 Swedish (Native - Release Matched)';
+      } else if (nativeSubs.length > 1) {
+        badge = `🇸🇪 Swedish (Native #${idx + 1})`;
+      }
+
       resultSubtitles.push({
         id: `native-sv-${idx}-${fullId}`,
         url: sub.url,
         lang: 'swe',
-        label: label,
+        label: badge,
         filename: sub.filename || 'swedish.srt',
         hearingImpaired: !!sub.hearingImpaired
       });
     });
 
-    // 2. Add AI Auto-Translated Subtitles (from English or candidate languages)
-    const engSubs = allSubs.filter(s => s.lang && (s.lang === 'eng' || s.lang === 'en' || s.lang.startsWith('eng') || s.lang.startsWith('en')));
-    const candidateSubs = engSubs.length > 0 ? engSubs : allSubs.filter(s => s.url);
+    // 2. AI Auto-Translated Subtitles (from English or candidate languages sorted by syncScore)
+    const engSubs = allSubs
+      .filter(s => s.lang && (s.lang === 'eng' || s.lang === 'en' || s.lang.startsWith('eng') || s.lang.startsWith('en')))
+      .sort((a, b) => b.syncScore - a.syncScore);
+
+    const candidateSubs = engSubs.length > 0 ? engSubs : allSubs.sort((a, b) => b.syncScore - a.syncScore);
 
     // Pick top 2 best candidate subtitles for AI translation
     const topCandidates = candidateSubs.slice(0, 2);
@@ -337,15 +415,20 @@ builder.defineSubtitlesHandler(async (args) => {
 
       const translatedUrl = `${baseUrl}/subtitles/translated/${fileId}.srt?src=${encodeURIComponent(sub.url)}&lang=${sub.lang || 'eng'}`;
 
-      const label = topCandidates.length > 1
-        ? `🇸🇪 Swedish (AI Auto-Translated #${idx + 1} from ${langCode})`
-        : `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
+      let badge = `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
+      if (sub.isHashMatch) {
+        badge = `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)`;
+      } else if (sub.syncScore > 20) {
+        badge = `🇸🇪 Swedish (AI Auto-Translated - Release Matched)`;
+      } else if (topCandidates.length > 1) {
+        badge = `🇸🇪 Swedish (AI Auto-Translated #${idx + 1} from ${langCode})`;
+      }
 
       resultSubtitles.push({
         id: `ai-sv-${idx}-${fileId}`,
         url: translatedUrl,
         lang: 'swe',
-        label: label,
+        label: badge,
         filename: `SV_AI_${langCode}_${sub.filename || 'sub.srt'}`,
         hearingImpaired: !!sub.hearingImpaired
       });
