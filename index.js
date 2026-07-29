@@ -12,6 +12,7 @@ try {
 }
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import pkg from 'stremio-addon-sdk';
 const { addonBuilder, getRouter } = pkg;
 import axios from 'axios';
@@ -409,7 +410,7 @@ builder.defineSubtitlesHandler(async (args) => {
 
     topCandidates.forEach((sub, idx) => {
       const langCode = (sub.lang || 'ENG').toUpperCase();
-      const fileId = Buffer.from(`${sub.url}`).toString('hex').slice(0, 32);
+      const fileId = crypto.createHash('md5').update(`${fullId}_${sub.url}`).digest('hex');
       
       SOURCE_URL_CACHE.set(fileId, sub.url);
 
