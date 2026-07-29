@@ -129,8 +129,15 @@ const fetchOpenSubtitles = async (type, id, extra = {}) => {
 
 const scoreSubtitle = (sub, videoFilename) => {
   let score = 0;
-  if (sub.isHashMatch || sub.m === 'h') score += 1000;
+  // Only genuine hash matches get the top bonus
+  if (sub.isHashMatch || sub.m === 'h') {
+    score += 2000;
+  }
   
+  // Popularity bonus based on download count (up to 500 points)
+  const downloads = parseInt(sub.g || '0', 10);
+  score += Math.min(downloads, 500);
+
   if (videoFilename && sub.filename) {
     const fnLow = videoFilename.toLowerCase();
     const subFnLow = sub.filename.toLowerCase();
@@ -138,15 +145,26 @@ const scoreSubtitle = (sub, videoFilename) => {
     const keywords = [
       '2160p', '1080p', '720p', '4k', 'bluray', 'bdrip', 'brrip', 'web-dl', 
       'webrip', 'hdtv', 'yify', 'rarbg', 'eztv', 'flux', 'psa', 'remux', 
-      'extended', 'unrated', 'proper', 'repack', 'x264', 'x265', 'h264', 'hevc'
+      'extended', 'unrated', 'proper', 'repack', 'x264', 'x265', 'h264', 'hevc',
+      'sparks', 'amiable', 'evo', 'ntb', 'qxr', 'utr', 'vxt', 'ion10', 'tgx'
     ];
     for (const kw of keywords) {
       if (fnLow.includes(kw) && subFnLow.includes(kw)) {
-        score += 50;
+        score += 40;
+      }
+    }
+
+    // Word overlap bonus for release matching
+    const cleanFn = fnLow.replace(/[^a-z0-9]/g, ' ');
+    const cleanSubFn = subFnLow.replace(/[^a-z0-9]/g, ' ');
+    const fnWords = cleanFn.split(/\s+/).filter(w => w.length > 2);
+    for (const word of fnWords) {
+      if (cleanSubFn.includes(word)) {
+        score += 15;
       }
     }
   }
-  score += parseInt(sub.g || '0', 10);
+  
   return score;
 };
 
@@ -156,7 +174,7 @@ const fetchMergedSubtitles = async (type, fullId, extra = {}) => {
   if (extra.videoHash) {
     proms.push(
       fetchOpenSubtitles(type, fullId, extra).then(subs => 
-        subs.map(s => ({ ...s, isHashMatch: true }))
+        subs.map(s => ({ ...s, isHashMatch: s.m === 'h' }))
       )
     );
   }
@@ -174,11 +192,14 @@ const fetchMergedSubtitles = async (type, fullId, extra = {}) => {
   for (const sub of combined) {
     const key = sub.url || sub.id;
     if (!key) continue;
+    
+    const isHashMatch = sub.isHashMatch || sub.m === 'h';
+
     if (subMap.has(key)) {
       const existing = subMap.get(key);
-      if (sub.isHashMatch) existing.isHashMatch = true;
+      if (isHashMatch) existing.isHashMatch = true;
     } else {
-      subMap.set(key, { ...sub });
+      subMap.set(key, { ...sub, isHashMatch });
     }
   }
 
@@ -209,9 +230,17 @@ const fixSrtTimecodes = (content) => {
 const cleanSubTagFormatting = (text) => {
   if (!text) return text;
   return text
+    // Remove ASS/SSA control tags like {\an8}, {\pos(100,200)}, {\b1}, etc.
+    .replace(/\{[^}]*\}/g, '')
+    // Remove standalone mangled ASS alignment artifacts like 'an8', '[an8]', '(an8)', 'AN8' at start/end or standalone
+    .replace(/^\s*\[?\b[aA][nN][1-9]\b\]?\s*/g, '')
+    .replace(/\s*\[?\b[aA][nN][1-9]\b\]?\s*$/g, '')
+    .replace(/\s*\[?\b[aA][nN][1-9]\b\]?\s*/g, ' ')
+    // Remove line break placeholders & clean HTML tags
     .replace(/\s*\[\s*BR\s*\]\s*/gi, '\n')
     .replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>')
-    .replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>');
+    .replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>')
+    .trim();
 };
 
 // Batch Translation Engines
@@ -363,8 +392,11 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
         return rawContent;
       }
 
-      // Preserve line breaks safely across translation APIs
-      const texts = subs.map(s => (s.text || '').replace(/\n/g, ' [BR] ').trim());
+      // Clean ASS control tags (e.g. {\an8}) and preserve line breaks safely across translation APIs
+      const texts = subs.map(s => {
+        const textWithoutAss = (s.text || '').replace(/\{[^}]*\}/g, '');
+        return textWithoutAss.replace(/\n/g, ' [BR] ').trim();
+      });
       const validIdx = texts.map((t, i) => (t ? i : -1)).filter(i => i !== -1);
       const toTranslate = validIdx.map(i => texts[i]);
 
