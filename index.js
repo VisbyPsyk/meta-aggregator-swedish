@@ -491,7 +491,7 @@ const evaluateSubMetadata = async (sub, type, videoFilename = '') => {
     const cues = parser.fromSrt(res.data);
     if (!cues || !cues.length) return null;
 
-    const minCues = type === 'movie' ? 500 : 120;
+    const minCues = type === 'movie' ? 80 : 30;
     if (cues.length < minCues) return null;
 
     let firstSec = 99999;
@@ -506,28 +506,38 @@ const evaluateSubMetadata = async (sub, type, videoFilename = '') => {
       }
     }
 
-    if (firstSec > 180) return null;
+    if (firstSec > 900) return null;
 
     let score = 0;
     if (sub.isHashMatch || sub.m === 'h') score += 10000;
 
-    if (type === 'movie' && cues.length >= 900 && cues.length <= 2200) score += 500;
-    if (type === 'series' && cues.length >= 300 && cues.length <= 1200) score += 500;
+    if (type === 'movie' && cues.length >= 800 && cues.length <= 2500) score += 500;
+    if (type === 'series' && cues.length >= 250 && cues.length <= 1500) score += 500;
 
-    if (firstSec >= 10 && firstSec <= 45) score += 400;
+    if (firstSec >= 10 && firstSec <= 60) score += 400;
 
-    if (videoFilename && sub.filename) {
+    if (videoFilename && (sub.filename || sub.url)) {
       const fnLow = videoFilename.toLowerCase();
-      const subFnLow = sub.filename.toLowerCase();
-      ['2160p', '1080p', '720p', 'bluray', 'web-dl', 'webrip', 'yify', 'rarbg', 'x264', 'hevc', 'repack'].forEach(kw => {
+      const subFnLow = (sub.filename || sub.url).toLowerCase();
+      const keywords = [
+        '2160p', '1080p', '720p', '4k', 'bluray', 'bdrip', 'brrip', 'web-dl', 
+        'webrip', 'hdtv', 'yify', 'rarbg', 'eztv', 'flux', 'psa', 'remux', 
+        'extended', 'unrated', 'proper', 'repack', 'x264', 'x265', 'h264', 'hevc',
+        'sparks', 'amiable', 'evo', 'ntb', 'qxr', 'utr', 'vxt', 'ion10', 'tgx'
+      ];
+      for (const kw of keywords) {
         if (fnLow.includes(kw) && subFnLow.includes(kw)) score += 100;
-      });
+      }
     }
 
     const downloads = parseInt(sub.g || '0', 10);
     score += Math.min(downloads * 5, 300);
 
-    return { ...sub, firstSec, cueCount: cues.length, score };
+    const mins = Math.floor(firstSec / 60).toString().padStart(2, '0');
+    const secs = Math.floor(firstSec % 60).toString().padStart(2, '0');
+    const timeStr = `${mins}:${secs}`;
+
+    return { ...sub, firstSec, timeStr, cueCount: cues.length, score };
   } catch (e) {
     return null;
   }
@@ -539,7 +549,7 @@ const evaluateAndSelectCandidates = async (subs, type, fullId, videoFilename = '
     return CANDIDATE_CACHE.get(cacheKey);
   }
 
-  const rawCandidates = subs.slice(0, 10);
+  const rawCandidates = subs.slice(0, 20);
   const evalResults = await Promise.all(rawCandidates.map(s => evaluateSubMetadata(s, type, videoFilename)));
   const valid = evalResults.filter(Boolean).sort((a, b) => b.score - a.score);
 
@@ -549,22 +559,28 @@ const evaluateAndSelectCandidates = async (subs, type, fullId, videoFilename = '
     return fallback;
   }
 
-  const primary = valid[0];
-  let alt = null;
+  const candidates = [valid[0]];
 
   for (let i = 1; i < valid.length; i++) {
-    if (Math.abs(valid[i].firstSec - primary.firstSec) >= 5) {
-      alt = valid[i];
-      break;
+    const item = valid[i];
+    const isDistinct = candidates.every(
+      c => Math.abs(c.firstSec - item.firstSec) >= 4 || Math.abs(c.cueCount - item.cueCount) / c.cueCount > 0.15
+    );
+    if (isDistinct) {
+      candidates.push(item);
+      if (candidates.length >= 3) break;
     }
   }
-  if (!alt && valid.length > 1) {
-    alt = valid[1];
+
+  if (candidates.length < 2 && valid.length > 1) {
+    candidates.push(valid[1]);
+  }
+  if (candidates.length < 3 && valid.length > 2 && !candidates.includes(valid[2])) {
+    candidates.push(valid[2]);
   }
 
-  const finalCandidates = alt ? [primary, alt] : [primary];
-  CANDIDATE_CACHE.set(cacheKey, finalCandidates);
-  return finalCandidates;
+  CANDIDATE_CACHE.set(cacheKey, candidates);
+  return candidates;
 };
 
 const builder = new addonBuilder(manifest);
@@ -596,11 +612,11 @@ builder.defineSubtitlesHandler(async (args) => {
 
         let badge = '🇸🇪 Swedish (Native)';
         if (sub.isHashMatch || sub.m === 'h') {
-          badge = idx === 0 ? '⚡ 🇸🇪 Swedish (Native - Hash Matched)' : '⚡ 🇸🇪 Swedish (Native - Hash Matched #2)';
+          badge = idx === 0 ? '⚡ 🇸🇪 Swedish (Native - Hash Matched)' : `⚡ 🇸🇪 Swedish (Native - Hash Matched #${idx + 1})`;
         } else if (idx === 0) {
           badge = '🇸🇪 Swedish (Native - Primary Sync)';
         } else {
-          badge = '🇸🇪 Swedish (Native - Alt Sync Option #2)';
+          badge = `🇸🇪 Swedish (Native - Alt Sync Option #${idx + 1}${sub.timeStr ? ' ~' + sub.timeStr : ''})`;
         }
 
         resultSubtitles.push({
@@ -634,11 +650,11 @@ builder.defineSubtitlesHandler(async (args) => {
 
         let badge = `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
         if (sub.isHashMatch || sub.m === 'h') {
-          badge = idx === 0 ? `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)` : `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched #2)`;
+          badge = idx === 0 ? `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)` : `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched #${idx + 1})`;
         } else if (idx === 0) {
           badge = `🇸🇪 Swedish (AI Auto-Translated - Primary Sync)`;
         } else {
-          badge = `🇸🇪 Swedish (AI Auto-Translated - Alt Sync Option #2)`;
+          badge = `🇸🇪 Swedish (AI Auto-Translated - Alt Sync Option #${idx + 1}${sub.timeStr ? ' ~' + sub.timeStr : ''})`;
         }
 
         resultSubtitles.push({
