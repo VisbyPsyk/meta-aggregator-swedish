@@ -70,10 +70,18 @@ class LRUCache {
 
 const TRANSLATED_CACHE = new LRUCache(500);
 const SOURCE_URL_CACHE = new LRUCache(1000);
+const TRANSLATING_PROMISES = new Map();
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err);
+});
 
 const manifest = {
   id: 'org.stremio.swedish.meta.universal',
-  version: '1.3.0',
+  version: '1.4.0',
   name: '🇸🇪 Swedish Universal Subtitles',
   description: 'Native Swedish subtitles + AI Auto-Translation fallback (DeepL / Azure / Free Google Translate). Fast & optimized for TV and Web.',
   logo: 'https://cdn.jsdelivr.net/gh/hakanburok/stremio-addons@main/logos/swedish-flag.png',
@@ -84,9 +92,15 @@ const manifest = {
     {
       name: 'subtitles',
       types: ['movie', 'series'],
-      idPrefixes: ['tt']
+      idPrefixes: ['tt'],
+      extra: [
+        { name: 'videoHash', isRequired: false },
+        { name: 'videoSize', isRequired: false },
+        { name: 'filename', isRequired: false }
+      ]
     }
   ],
+  extraSupported: ['videoHash', 'videoSize', 'filename'],
   behaviorHints: { configurable: false, adult: false, p2p: false }
 };
 
@@ -178,16 +192,26 @@ const fetchMergedSubtitles = async (type, fullId, extra = {}) => {
 };
 
 const fixSrtTimecodes = (content) => {
+  if (!content || typeof content !== 'string') return '';
   let clean = content.trim();
   clean = clean.replace(/^WEBVTT[^\n]*\n*/i, '');
   clean = clean.replace(/NOTE[^\n]*\n(?:[^\n]*\n)*/gi, '');
   clean = clean.replace(/STYLE[^\n]*\n(?:[^\n]*\n)*/gi, '');
+  clean = clean.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   
   return clean.replace(/(\b\d{1,2}:)?(\d{2}:\d{2})[\.,](\d{3})\s*-->\s*(\b\d{1,2}:)?(\d{2}:\d{2})[\.,](\d{3})/g, (m, h1, ms1, ms2, h2, ms3, ms4) => {
     const hh1 = h1 ? h1.replace(':', '').padStart(2, '0') : '00';
     const hh2 = h2 ? h2.replace(':', '').padStart(2, '0') : '00';
     return `${hh1}:${ms1},${ms2} --> ${hh2}:${ms3},${ms4}`;
   });
+};
+
+const cleanSubTagFormatting = (text) => {
+  if (!text) return text;
+  return text
+    .replace(/\s*\[\s*BR\s*\]\s*/gi, '\n')
+    .replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>')
+    .replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>');
 };
 
 // Batch Translation Engines
@@ -314,49 +338,60 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
     return TRANSLATED_CACHE.get(fileId);
   }
 
-  try {
-    const { data: rawContent } = await axios.get(sourceUrl, { 
-      responseType: 'text', 
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Stremio Subtitle Translator)' }
-    });
-    
-    if (!rawContent || typeof rawContent !== 'string') return null;
-
-    // Clean up WEBVTT or SRT formatting quirks and fix timecodes
-    const cleanContent = fixSrtTimecodes(rawContent);
-
-    const parser = new Parser();
-    const subs = parser.fromSrt(cleanContent);
-    if (!subs || !subs.length) {
-      // If parsing failed, cache raw content as fallback
-      TRANSLATED_CACHE.set(fileId, rawContent);
-      return rawContent;
-    }
-
-    // Preserve line breaks safely across translation APIs
-    const texts = subs.map(s => (s.text || '').replace(/\n/g, ' [BR] ').trim());
-    const validIdx = texts.map((t, i) => (t ? i : -1)).filter(i => i !== -1);
-    const toTranslate = validIdx.map(i => texts[i]);
-
-    const translated = await translateText(toTranslate);
-
-    let tIdx = 0;
-    const newSubs = subs.map((s, i) => {
-      if (validIdx.includes(i)) {
-        const transText = translated[tIdx++] || s.text;
-        return { ...s, text: transText.replace(/ \[BR\] /gi, '\n') };
-      }
-      return s;
-    });
-
-    const sweSrt = parser.toSrt(newSubs);
-    TRANSLATED_CACHE.set(fileId, sweSrt);
-    return sweSrt;
-  } catch (e) {
-    console.error('Error fetching/translating subtitle:', e.message);
-    return null;
+  if (TRANSLATING_PROMISES.has(fileId)) {
+    return await TRANSLATING_PROMISES.get(fileId);
   }
+
+  const translationPromise = (async () => {
+    try {
+      const { data: rawContent } = await axios.get(sourceUrl, { 
+        responseType: 'text', 
+        timeout: 15000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Stremio Subtitle Translator)' }
+      });
+      
+      if (!rawContent || typeof rawContent !== 'string') return null;
+
+      // Clean up WEBVTT or SRT formatting quirks and fix timecodes
+      const cleanContent = fixSrtTimecodes(rawContent);
+
+      const parser = new Parser();
+      const subs = parser.fromSrt(cleanContent);
+      if (!subs || !subs.length) {
+        // If parsing failed, cache raw content as fallback
+        TRANSLATED_CACHE.set(fileId, rawContent);
+        return rawContent;
+      }
+
+      // Preserve line breaks safely across translation APIs
+      const texts = subs.map(s => (s.text || '').replace(/\n/g, ' [BR] ').trim());
+      const validIdx = texts.map((t, i) => (t ? i : -1)).filter(i => i !== -1);
+      const toTranslate = validIdx.map(i => texts[i]);
+
+      const translated = await translateText(toTranslate);
+
+      let tIdx = 0;
+      const newSubs = subs.map((s, i) => {
+        if (validIdx.includes(i)) {
+          const transText = translated[tIdx++] || s.text;
+          return { ...s, text: cleanSubTagFormatting(transText) };
+        }
+        return s;
+      });
+
+      const sweSrt = parser.toSrt(newSubs);
+      TRANSLATED_CACHE.set(fileId, sweSrt);
+      return sweSrt;
+    } catch (e) {
+      console.error('Error fetching/translating subtitle:', e.message);
+      return null;
+    } finally {
+      TRANSLATING_PROMISES.delete(fileId);
+    }
+  })();
+
+  TRANSLATING_PROMISES.set(fileId, translationPromise);
+  return await translationPromise;
 };
 
 const builder = new addonBuilder(manifest);
@@ -504,7 +539,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="card">
-        <span class="badge">STREMIO ADDON v1.3.0</span>
+        <span class="badge">STREMIO ADDON v1.4.0</span>
         <h1>🇸🇪 Swedish Universal Subtitles</h1>
         <p>Native Swedish subtitles with AI auto-translation fallback for Movies & TV Series. Fully optimized for Stremio TV, Android, iOS, Web, and Desktop.</p>
 
