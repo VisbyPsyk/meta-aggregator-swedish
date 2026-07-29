@@ -129,15 +129,22 @@ const fetchOpenSubtitles = async (type, id, extra = {}) => {
 
 const scoreSubtitle = (sub, videoFilename) => {
   let score = 0;
-  // Only genuine hash matches get the top bonus
-  if (sub.isHashMatch || sub.m === 'h') {
-    score += 2000;
-  }
   
-  // Popularity bonus based on download count (up to 500 points)
-  const downloads = parseInt(sub.g || '0', 10);
-  score += Math.min(downloads, 500);
+  // 1. Strict Hash match (100% exact frame-sync for this specific video file)
+  if (sub.isHashMatch || sub.m === 'h') {
+    score += 5000;
+  }
 
+  // 2. Download count weight (Popularity - most downloaded release is almost always the main YIFY/BluRay/WEB-DL sync)
+  const downloads = parseInt(sub.g || '0', 10);
+  score += Math.min(downloads * 15, 1500);
+
+  // 3. UTF-8 encoding preference
+  if (sub.SubEncoding === 'UTF-8') {
+    score += 50;
+  }
+
+  // 4. Filename matching
   if (videoFilename && sub.filename) {
     const fnLow = videoFilename.toLowerCase();
     const subFnLow = sub.filename.toLowerCase();
@@ -150,17 +157,16 @@ const scoreSubtitle = (sub, videoFilename) => {
     ];
     for (const kw of keywords) {
       if (fnLow.includes(kw) && subFnLow.includes(kw)) {
-        score += 40;
+        score += 60;
       }
     }
 
-    // Word overlap bonus for release matching
     const cleanFn = fnLow.replace(/[^a-z0-9]/g, ' ');
     const cleanSubFn = subFnLow.replace(/[^a-z0-9]/g, ' ');
     const fnWords = cleanFn.split(/\s+/).filter(w => w.length > 2);
     for (const word of fnWords) {
       if (cleanSubFn.includes(word)) {
-        score += 15;
+        score += 20;
       }
     }
   }
@@ -228,19 +234,28 @@ const fixSrtTimecodes = (content) => {
 };
 
 const cleanSubTagFormatting = (text) => {
-  if (!text) return text;
-  return text
-    // Remove ASS/SSA control tags like {\an8}, {\pos(100,200)}, {\b1}, etc.
-    .replace(/\{[^}]*\}/g, '')
-    // Remove standalone mangled ASS alignment artifacts like 'an8', '[an8]', '(an8)', 'AN8' at start/end or standalone
-    .replace(/^\s*\[?\b[aA][nN][1-9]\b\]?\s*/g, '')
-    .replace(/\s*\[?\b[aA][nN][1-9]\b\]?\s*$/g, '')
-    .replace(/\s*\[?\b[aA][nN][1-9]\b\]?\s*/g, ' ')
-    // Remove line break placeholders & clean HTML tags
-    .replace(/\s*\[\s*BR\s*\]\s*/gi, '\n')
-    .replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>')
-    .replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>')
-    .trim();
+  if (!text) return '';
+  let cleaned = text;
+
+  // 1. Remove standard ASS/SSA control tags: {\an8}, {\pos(100,200)}, {\b1}, {\c&H...&}, {\fad(...)}, etc.
+  cleaned = cleaned.replace(/\{[^}]*\}/g, '');
+
+  // 2. Remove mangled/unbraced ASS alignment tags (an1 - an9, \an1 - \an9)
+  // e.g., 'an8 ', '\an8 ', '[an8]', '(an8)', 'AN8', 'an8:', 'an8 -'
+  cleaned = cleaned.replace(/^\s*\\[aA][nN][1-9]\s*/g, '');
+  cleaned = cleaned.replace(/^\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*/gi, '');
+  cleaned = cleaned.replace(/\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*$/gi, '');
+  cleaned = cleaned.replace(/\s+\[?\(?[aA][nN][1-9]\)?\]?\s+/gi, ' ');
+
+  // 3. Remove ASS position tags like pos(120,300) or \pos(...)
+  cleaned = cleaned.replace(/\\?pos\(\d+,\d+\)/gi, '');
+
+  // 4. Remove line break placeholders & clean HTML tags
+  cleaned = cleaned.replace(/\s*\[\s*BR\s*\]\s*/gi, '\n');
+  cleaned = cleaned.replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>');
+  cleaned = cleaned.replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>');
+  
+  return cleaned.trim();
 };
 
 // Batch Translation Engines
@@ -426,6 +441,42 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
   return await translationPromise;
 };
 
+const getOrCleanNativeSubtitle = async (sourceUrl, fileId) => {
+  if (TRANSLATED_CACHE.has(fileId)) {
+    return TRANSLATED_CACHE.get(fileId);
+  }
+
+  try {
+    const { data: rawContent } = await axios.get(sourceUrl, {
+      responseType: 'text',
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Stremio Subtitle Cleaner)' }
+    });
+
+    if (!rawContent || typeof rawContent !== 'string') return null;
+
+    const cleanContent = fixSrtTimecodes(rawContent);
+    const parser = new Parser();
+    const subs = parser.fromSrt(cleanContent);
+    if (!subs || !subs.length) {
+      TRANSLATED_CACHE.set(fileId, rawContent);
+      return rawContent;
+    }
+
+    const cleanedSubs = subs.map(s => ({
+      ...s,
+      text: cleanSubTagFormatting(s.text)
+    }));
+
+    const cleanSrt = parser.toSrt(cleanedSubs);
+    TRANSLATED_CACHE.set(fileId, cleanSrt);
+    return cleanSrt;
+  } catch (e) {
+    console.error('Error fetching/cleaning native subtitle:', e.message);
+    return null;
+  }
+};
+
 const builder = new addonBuilder(manifest);
 
 builder.defineSubtitlesHandler(async (args) => {
@@ -446,18 +497,22 @@ builder.defineSubtitlesHandler(async (args) => {
       .sort((a, b) => b.syncScore - a.syncScore);
 
     nativeSubs.forEach((sub, idx) => {
+      const fileId = crypto.createHash('md5').update(`native_${fullId}_${sub.url}`).digest('hex');
+      SOURCE_URL_CACHE.set(fileId, sub.url);
+      const cleanNativeUrl = `${baseUrl}/subtitles/native/${fileId}.srt?src=${encodeURIComponent(sub.url)}`;
+
       let badge = '🇸🇪 Swedish (Native)';
       if (sub.isHashMatch) {
         badge = '⚡ 🇸🇪 Swedish (Native - Hash Matched)';
-      } else if (sub.syncScore > 20) {
+      } else if (sub.syncScore > 300) {
         badge = '🇸🇪 Swedish (Native - Release Matched)';
       } else if (nativeSubs.length > 1) {
         badge = `🇸🇪 Swedish (Native #${idx + 1})`;
       }
 
       resultSubtitles.push({
-        id: `native-sv-${idx}-${fullId}`,
-        url: sub.url,
+        id: `native-sv-${idx}-${fileId}`,
+        url: cleanNativeUrl,
         lang: 'swe',
         label: badge,
         filename: sub.filename || 'swedish.srt',
@@ -602,6 +657,37 @@ app.get('/', (req, res) => {
     </body>
     </html>
   `);
+});
+
+// Native Swedish Subtitle endpoint (cleans formatting & ASS tags)
+app.get('/subtitles/native/:fileId.srt', async (req, res) => {
+  const { fileId } = req.params;
+  const sourceUrl = req.query.src || SOURCE_URL_CACHE.get(fileId);
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+
+  if (TRANSLATED_CACHE.has(fileId)) {
+    return res.status(200).send(TRANSLATED_CACHE.get(fileId));
+  }
+
+  if (!sourceUrl) {
+    return res.status(404).send('Subtitle source URL not found or link expired.');
+  }
+
+  try {
+    const srtData = await getOrCleanNativeSubtitle(sourceUrl, fileId);
+    if (!srtData) {
+      return res.status(500).send('Failed to fetch native subtitle.');
+    }
+    return res.status(200).send(srtData);
+  } catch (err) {
+    console.error('Error serving native subtitle:', err.message);
+    return res.status(500).send('Error processing subtitle file.');
+  }
 });
 
 // Subtitle file endpoint optimized for Stremio TV & Players (ExoPlayer, VLC, WebOS, Tizen)
