@@ -233,27 +233,31 @@ const fixSrtTimecodes = (content) => {
   });
 };
 
+const removeAssTags = (text) => {
+  if (!text) return '';
+  return text
+    // 1. Remove curly-brace ASS tags: {\an8}, {\pos(100,200)}, {\b1}, {\c&H...&}, {\fad(...)}, etc.
+    .replace(/\{[^}]*\}/g, '')
+    // 2. Remove unbraced/escaped ASS alignment tags: \an8, \an1-9, an8, AN8, \an1..9
+    .replace(/(?:\\|\b)[aA][nN][1-9]\b[:\-]?/gi, '')
+    // 3. Remove ASS position tags: \pos(x,y) or pos(x,y)
+    .replace(/(?:\\|\b)pos\(\d+,\d+\)/gi, '')
+    // 4. Remove unbraced ASS style tags
+    .replace(/\\(?:b|i|u|fn|fs|c|1c|2c|3c|4c|alpha|1a|2a|3a|4a|k|K|kf|ko|q|r)\b[^\s\\]*/gi, '');
+};
+
 const cleanSubTagFormatting = (text) => {
   if (!text) return '';
-  let cleaned = text;
+  let cleaned = removeAssTags(text);
 
-  // 1. Remove standard ASS/SSA control tags: {\an8}, {\pos(100,200)}, {\b1}, {\c&H...&}, {\fad(...)}, etc.
-  cleaned = cleaned.replace(/\{[^}]*\}/g, '');
-
-  // 2. Remove mangled/unbraced ASS alignment tags (an1 - an9, \an1 - \an9)
-  // e.g., 'an8 ', '\an8 ', '[an8]', '(an8)', 'AN8', 'an8:', 'an8 -'
-  cleaned = cleaned.replace(/^\s*\\[aA][nN][1-9]\s*/g, '');
-  cleaned = cleaned.replace(/^\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*/gi, '');
-  cleaned = cleaned.replace(/\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*$/gi, '');
-  cleaned = cleaned.replace(/\s+\[?\(?[aA][nN][1-9]\)?\]?\s+/gi, ' ');
-
-  // 3. Remove ASS position tags like pos(120,300) or \pos(...)
-  cleaned = cleaned.replace(/\\?pos\(\d+,\d+\)/gi, '');
-
-  // 4. Remove line break placeholders & clean HTML tags
-  cleaned = cleaned.replace(/\s*\[\s*BR\s*\]\s*/gi, '\n');
-  cleaned = cleaned.replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>');
-  cleaned = cleaned.replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>');
+  // Remove standalone mangled ASS alignment artifacts like 'an8', '[an8]', '(an8)', 'AN8'
+  cleaned = cleaned
+    .replace(/^\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*/gi, '')
+    .replace(/\s*\[?\(?[aA][nN][1-9]\)?\]?[:\-]?\s*$/gi, '')
+    .replace(/\s+\[?\(?[aA][nN][1-9]\)?\]?\s+/gi, ' ')
+    .replace(/\s*\[\s*BR\s*\]\s*/gi, '\n')
+    .replace(/<\s*\/\s*([a-z]+)\s*>/gi, '</$1>')
+    .replace(/<\s*([a-z]+)(\s+[^>]*)?>/gi, '<$1$2>');
   
   return cleaned.trim();
 };
@@ -407,9 +411,9 @@ const getOrTranslateSubtitle = async (sourceUrl, fileId) => {
         return rawContent;
       }
 
-      // Clean ASS control tags (e.g. {\an8}) and preserve line breaks safely across translation APIs
+      // Clean ASS control tags (e.g. {\an8}, \an8) and preserve line breaks safely across translation APIs
       const texts = subs.map(s => {
-        const textWithoutAss = (s.text || '').replace(/\{[^}]*\}/g, '');
+        const textWithoutAss = removeAssTags(s.text || '');
         return textWithoutAss.replace(/\n/g, ' [BR] ').trim();
       });
       const validIdx = texts.map((t, i) => (t ? i : -1)).filter(i => i !== -1);
@@ -527,12 +531,20 @@ builder.defineSubtitlesHandler(async (args) => {
 
     const candidateSubs = engSubs.length > 0 ? engSubs : allSubs.sort((a, b) => b.syncScore - a.syncScore);
 
-    // Pick top 2 best candidate subtitles for AI translation
-    const topCandidates = candidateSubs.slice(0, 2);
+    // Ensure candidate 1 & 2 are distinct subtitle sources
+    const topCandidates = [];
+    const seenUrls = new Set();
+    for (const s of candidateSubs) {
+      if (s.url && !seenUrls.has(s.url)) {
+        seenUrls.add(s.url);
+        topCandidates.push(s);
+        if (topCandidates.length >= 2) break;
+      }
+    }
 
     topCandidates.forEach((sub, idx) => {
       const langCode = (sub.lang || 'ENG').toUpperCase();
-      const fileId = crypto.createHash('md5').update(`${fullId}_${sub.url}`).digest('hex');
+      const fileId = crypto.createHash('md5').update(`${fullId}_${sub.url}_${idx}`).digest('hex');
       
       SOURCE_URL_CACHE.set(fileId, sub.url);
 
@@ -540,11 +552,11 @@ builder.defineSubtitlesHandler(async (args) => {
 
       let badge = `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
       if (sub.isHashMatch) {
-        badge = `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)`;
-      } else if (sub.syncScore > 20) {
-        badge = `🇸🇪 Swedish (AI Auto-Translated - Release Matched)`;
-      } else if (topCandidates.length > 1) {
-        badge = `🇸🇪 Swedish (AI Auto-Translated #${idx + 1} from ${langCode})`;
+        badge = idx === 0 ? `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)` : `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched #2)`;
+      } else if (sub.syncScore > 300) {
+        badge = idx === 0 ? `🇸🇪 Swedish (AI Auto-Translated - Primary Sync)` : `🇸🇪 Swedish (AI Auto-Translated - Alt Sync Option #2)`;
+      } else {
+        badge = `🇸🇪 Swedish (AI Auto-Translated Option #${idx + 1})`;
       }
 
       resultSubtitles.push({
