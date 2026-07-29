@@ -70,6 +70,7 @@ class LRUCache {
 
 const TRANSLATED_CACHE = new LRUCache(500);
 const SOURCE_URL_CACHE = new LRUCache(1000);
+const CANDIDATE_CACHE = new LRUCache(200);
 const TRANSLATING_PROMISES = new Map();
 
 process.on('unhandledRejection', (reason) => {
@@ -481,6 +482,91 @@ const getOrCleanNativeSubtitle = async (sourceUrl, fileId) => {
   }
 };
 
+const evaluateSubMetadata = async (sub, type, videoFilename = '') => {
+  try {
+    const res = await axios.get(sub.url, { responseType: 'text', timeout: 3500 });
+    if (!res.data || typeof res.data !== 'string') return null;
+
+    const parser = new Parser();
+    const cues = parser.fromSrt(res.data);
+    if (!cues || !cues.length) return null;
+
+    const minCues = type === 'movie' ? 500 : 120;
+    if (cues.length < minCues) return null;
+
+    let firstSec = 99999;
+    for (const c of cues) {
+      if (!c.startTime) continue;
+      const parts = c.startTime.split(':');
+      if (parts.length === 3) {
+        const sec = parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseFloat(parts[2].replace(',', '.'));
+        if (sec < 5 && cues.length > 1 && /rip|sub|by|enjoy|credit/i.test(c.text)) continue;
+        firstSec = sec;
+        break;
+      }
+    }
+
+    if (firstSec > 180) return null;
+
+    let score = 0;
+    if (sub.isHashMatch || sub.m === 'h') score += 10000;
+
+    if (type === 'movie' && cues.length >= 900 && cues.length <= 2200) score += 500;
+    if (type === 'series' && cues.length >= 300 && cues.length <= 1200) score += 500;
+
+    if (firstSec >= 10 && firstSec <= 45) score += 400;
+
+    if (videoFilename && sub.filename) {
+      const fnLow = videoFilename.toLowerCase();
+      const subFnLow = sub.filename.toLowerCase();
+      ['2160p', '1080p', '720p', 'bluray', 'web-dl', 'webrip', 'yify', 'rarbg', 'x264', 'hevc', 'repack'].forEach(kw => {
+        if (fnLow.includes(kw) && subFnLow.includes(kw)) score += 100;
+      });
+    }
+
+    const downloads = parseInt(sub.g || '0', 10);
+    score += Math.min(downloads * 5, 300);
+
+    return { ...sub, firstSec, cueCount: cues.length, score };
+  } catch (e) {
+    return null;
+  }
+};
+
+const evaluateAndSelectCandidates = async (subs, type, fullId, videoFilename = '') => {
+  const cacheKey = `${type}_${fullId}_${videoFilename}_${subs.length}`;
+  if (CANDIDATE_CACHE.has(cacheKey)) {
+    return CANDIDATE_CACHE.get(cacheKey);
+  }
+
+  const rawCandidates = subs.slice(0, 10);
+  const evalResults = await Promise.all(rawCandidates.map(s => evaluateSubMetadata(s, type, videoFilename)));
+  const valid = evalResults.filter(Boolean).sort((a, b) => b.score - a.score);
+
+  if (!valid.length) {
+    const fallback = subs.slice(0, 2);
+    CANDIDATE_CACHE.set(cacheKey, fallback);
+    return fallback;
+  }
+
+  const primary = valid[0];
+  let alt = null;
+
+  for (let i = 1; i < valid.length; i++) {
+    if (Math.abs(valid[i].firstSec - primary.firstSec) >= 5) {
+      alt = valid[i];
+      break;
+    }
+  }
+  if (!alt && valid.length > 1) {
+    alt = valid[1];
+  }
+
+  const finalCandidates = alt ? [primary, alt] : [primary];
+  CANDIDATE_CACHE.set(cacheKey, finalCandidates);
+  return finalCandidates;
+};
+
 const builder = new addonBuilder(manifest);
 
 builder.defineSubtitlesHandler(async (args) => {
@@ -489,85 +575,82 @@ builder.defineSubtitlesHandler(async (args) => {
     const fullId = args.id;
     const extra = args.extra || {};
     const baseUrl = getBaseUrl();
+    const videoFilename = extra.filename || '';
 
     const allSubs = await fetchMergedSubtitles(args.type, fullId, extra);
     if (!allSubs.length) return { subtitles: [] };
 
     const resultSubtitles = [];
 
-    // 1. Native Swedish Subtitles (Sorted by syncScore descending)
-    const nativeSubs = allSubs
+    // 1. Native Swedish Subtitles
+    const nativeRaw = allSubs
       .filter(s => s.lang && (s.lang === 'swe' || s.lang === 'sv' || s.lang.startsWith('swe') || s.lang.startsWith('sv')))
       .sort((a, b) => b.syncScore - a.syncScore);
 
-    nativeSubs.forEach((sub, idx) => {
-      const fileId = crypto.createHash('md5').update(`native_${fullId}_${sub.url}`).digest('hex');
-      SOURCE_URL_CACHE.set(fileId, sub.url);
-      const cleanNativeUrl = `${baseUrl}/subtitles/native/${fileId}.srt?src=${encodeURIComponent(sub.url)}`;
+    if (nativeRaw.length > 0) {
+      const nativeCandidates = await evaluateAndSelectCandidates(nativeRaw, args.type, fullId, videoFilename);
+      nativeCandidates.forEach((sub, idx) => {
+        const fileId = crypto.createHash('md5').update(`native_${fullId}_${sub.url}_${idx}`).digest('hex');
+        SOURCE_URL_CACHE.set(fileId, sub.url);
+        const cleanNativeUrl = `${baseUrl}/subtitles/native/${fileId}.srt?src=${encodeURIComponent(sub.url)}`;
 
-      let badge = '🇸🇪 Swedish (Native)';
-      if (sub.isHashMatch) {
-        badge = '⚡ 🇸🇪 Swedish (Native - Hash Matched)';
-      } else if (sub.syncScore > 300) {
-        badge = '🇸🇪 Swedish (Native - Release Matched)';
-      } else if (nativeSubs.length > 1) {
-        badge = `🇸🇪 Swedish (Native #${idx + 1})`;
-      }
+        let badge = '🇸🇪 Swedish (Native)';
+        if (sub.isHashMatch || sub.m === 'h') {
+          badge = idx === 0 ? '⚡ 🇸🇪 Swedish (Native - Hash Matched)' : '⚡ 🇸🇪 Swedish (Native - Hash Matched #2)';
+        } else if (idx === 0) {
+          badge = '🇸🇪 Swedish (Native - Primary Sync)';
+        } else {
+          badge = '🇸🇪 Swedish (Native - Alt Sync Option #2)';
+        }
 
-      resultSubtitles.push({
-        id: `native-sv-${idx}-${fileId}`,
-        url: cleanNativeUrl,
-        lang: 'swe',
-        label: badge,
-        filename: sub.filename || 'swedish.srt',
-        hearingImpaired: !!sub.hearingImpaired
+        resultSubtitles.push({
+          id: `native-sv-${idx}-${fileId}`,
+          url: cleanNativeUrl,
+          lang: 'swe',
+          label: badge,
+          filename: sub.filename || 'swedish.srt',
+          hearingImpaired: !!sub.hearingImpaired
+        });
       });
-    });
+    }
 
-    // 2. AI Auto-Translated Subtitles (from English or candidate languages sorted by syncScore)
-    const engSubs = allSubs
+    // 2. AI Auto-Translated Subtitles (from English or candidate languages)
+    const engRaw = allSubs
       .filter(s => s.lang && (s.lang === 'eng' || s.lang === 'en' || s.lang.startsWith('eng') || s.lang.startsWith('en')))
       .sort((a, b) => b.syncScore - a.syncScore);
 
-    const candidateSubs = engSubs.length > 0 ? engSubs : allSubs.sort((a, b) => b.syncScore - a.syncScore);
+    const targetRaw = engRaw.length > 0 ? engRaw : allSubs.sort((a, b) => b.syncScore - a.syncScore);
 
-    // Ensure candidate 1 & 2 are distinct subtitle sources
-    const topCandidates = [];
-    const seenUrls = new Set();
-    for (const s of candidateSubs) {
-      if (s.url && !seenUrls.has(s.url)) {
-        seenUrls.add(s.url);
-        topCandidates.push(s);
-        if (topCandidates.length >= 2) break;
-      }
-    }
+    if (targetRaw.length > 0) {
+      const aiCandidates = await evaluateAndSelectCandidates(targetRaw, args.type, fullId, videoFilename);
 
-    topCandidates.forEach((sub, idx) => {
-      const langCode = (sub.lang || 'ENG').toUpperCase();
-      const fileId = crypto.createHash('md5').update(`${fullId}_${sub.url}_${idx}`).digest('hex');
-      
-      SOURCE_URL_CACHE.set(fileId, sub.url);
+      aiCandidates.forEach((sub, idx) => {
+        const langCode = (sub.lang || 'ENG').toUpperCase();
+        const fileId = crypto.createHash('md5').update(`${fullId}_${sub.url}_${idx}`).digest('hex');
+        
+        SOURCE_URL_CACHE.set(fileId, sub.url);
 
-      const translatedUrl = `${baseUrl}/subtitles/translated/${fileId}.srt?src=${encodeURIComponent(sub.url)}&lang=${sub.lang || 'eng'}`;
+        const translatedUrl = `${baseUrl}/subtitles/translated/${fileId}.srt?src=${encodeURIComponent(sub.url)}&lang=${sub.lang || 'eng'}`;
 
-      let badge = `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
-      if (sub.isHashMatch) {
-        badge = idx === 0 ? `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)` : `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched #2)`;
-      } else if (sub.syncScore > 300) {
-        badge = idx === 0 ? `🇸🇪 Swedish (AI Auto-Translated - Primary Sync)` : `🇸🇪 Swedish (AI Auto-Translated - Alt Sync Option #2)`;
-      } else {
-        badge = `🇸🇪 Swedish (AI Auto-Translated Option #${idx + 1})`;
-      }
+        let badge = `🇸🇪 Swedish (AI Auto-Translated from ${langCode})`;
+        if (sub.isHashMatch || sub.m === 'h') {
+          badge = idx === 0 ? `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched)` : `⚡ 🇸🇪 Swedish (AI Auto-Translated - Hash Matched #2)`;
+        } else if (idx === 0) {
+          badge = `🇸🇪 Swedish (AI Auto-Translated - Primary Sync)`;
+        } else {
+          badge = `🇸🇪 Swedish (AI Auto-Translated - Alt Sync Option #2)`;
+        }
 
-      resultSubtitles.push({
-        id: `ai-sv-${idx}-${fileId}`,
-        url: translatedUrl,
-        lang: 'swe',
-        label: badge,
-        filename: `SV_AI_${langCode}_${sub.filename || 'sub.srt'}`,
-        hearingImpaired: !!sub.hearingImpaired
+        resultSubtitles.push({
+          id: `ai-sv-${idx}-${fileId}`,
+          url: translatedUrl,
+          lang: 'swe',
+          label: badge,
+          filename: `SV_AI_${langCode}_${sub.filename || 'sub.srt'}`,
+          hearingImpaired: !!sub.hearingImpaired
+        });
       });
-    });
+    }
 
     return { subtitles: resultSubtitles };
   } catch (err) {
